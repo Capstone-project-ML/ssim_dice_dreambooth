@@ -16,3 +16,9 @@ python evaluate.py \
   --calculate_extended_metrics \
   --seg_model_weights "./path/to/your/seg_model.pth" \
   --real_masks_path "./path/to/your/xray_masks"
+
+  command to run prompt tester:
+  python research_prompt_suite.py \
+  --model_path "./results_dreambooth_ssim" \
+  --model_type "ssim" \
+  --output_dir "./research_suite_output"
