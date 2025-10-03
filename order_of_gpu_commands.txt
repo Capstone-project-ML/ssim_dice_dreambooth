@@ -1,0 +1,16 @@
+sudo apt install nano
+sudo apt update
+sudo apt install python3-pip
+sudo apt install python3-venv
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install kaggle
+mkdir -p ~/.kaggle
+nano kaggle.json
+mv kaggle.json ~/.kaggle/
+chmod 600 ~/.kaggle/kaggle.json
+kaggle datasets download -d nih-chest-xrays/sample
+sudo apt install unzip
+unzip sample.zip
+pip install pandas torch opencv-python torchvision diffusers transformers peft matplotlib
+sudo apt-get install libgl1 
