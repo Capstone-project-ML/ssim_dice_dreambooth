@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="./results_dreambooth_dice", help="Directory to save the model and logs.")
     parser.add_argument("--seg_model_weights", type=str, required=True, help="Path to pre-trained segmentation model weights.")
     parser.add_argument("--unique_token", type=str, default="<nih-xray>", help="Unique token for your concept.")
-    parser.add_argument("--class_token", type=str, default="x-ray", help="General class for prior preservation.")
+    parser.add_argument("--class_token", type=str, default="chest x-ray", help="General class for prior preservation.")
     parser.add_argument("--class_data_dir", type=str, default="./class_images_xray", help="Directory to cache generated class images.")
     parser.add_argument("--num_class_images", type=int, default=200, help="Number of class images for prior preservation.")
     parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="Weight for prior preservation loss.")
@@ -170,4 +170,5 @@ def main():
     # --- (Checkpointing, final saving, and plotting are the same, just update plot labels for Dice) ---
 
 if __name__ == "__main__":
+
     main()
