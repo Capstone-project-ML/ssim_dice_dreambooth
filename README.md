@@ -11,7 +11,7 @@ command to run evaluate.py:
 python evaluate.py \
   --model_path "./results_dreambooth_dice/final_model" \
   --real_images_path "./sample/images" \
-  --prompt "a photo of <nih-xray>" \
+  --prompt "a photo of \<nih-xray\>" \
   --num_samples 10 \
   --calculate_extended_metrics \
   --seg_model_weights "./path/to/your/seg_model.pth" \
