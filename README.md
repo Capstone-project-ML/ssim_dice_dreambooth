@@ -1,6 +1,3 @@
-CheXmask: https://github.com/ngaggion/CheXmask-Database?tab=readme-ov-file
-(Download the segmentation model weights from here)
-
 NIH Binary Segmentation Masks: https://www.kaggle.com/datasets/smeraa/nih-sample-segmentation-masks
 
 Info about the 3 finetuning codes: https://docs.google.com/spreadsheets/d/1I_K_XJViRuMjK47kHTt1ADlrx5gD3Z_vMITQRlgAqWM/edit?usp=sharing
