@@ -1,10 +1,10 @@
-# evaluate_plus.py
+# evaluate.py
 #
 # An extended script to calculate a comprehensive set of quantitative metrics for
 # fine-tuned Stable Diffusion models.
 #
 # Includes: FID, CLIP Score, Inception Score (IS), Kernel Inception Distance (KID),
-#           Dice Score (for segmentation), SSIM, PSNR, and Aesthetic Score.
+#           Dice Score (for segmentation), SSIM, and PSNR.
 
 import os
 import argparse
@@ -17,15 +17,15 @@ import numpy as np
 
 # --- New Imports for Extended Metrics ---
 # Make sure to install these packages:
-# pip install torchmetrics segmentation-models-pytorch monai timm transformers
+# pip install torchmetrics segmentation-models-pytorch monai timm
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.multimodal.clip_score import CLIPScore
-from torchmetrics.image.inception import InceptionScore, KernelInceptionDistance
+from torchmetrics.image.inception import InceptionScore
+from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics import Dice
+from torchmetrics.segmentation import dice
 import segmentation_models_pytorch as smp
 from torchvision import transforms
-from transformers import CLIPProcessor, CLIPModel
 
 # --- Helper Functions ---
 
@@ -48,10 +48,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible generation.")
 
     # Extended metrics arguments
-    parser.add_argument("--calculate_extended_metrics", action="store_true", help="Flag to enable calculation of IS, KID, SSIM, PSNR, Dice, and Aesthetic score.")
+    parser.add_argument("--calculate_extended_metrics", action="store_true", help="Flag to enable calculation of IS, KID, SSIM, PSNR, and Dice score.")
     parser.add_argument("--seg_model_weights", type=str, default=None, help="[Required for Dice] Path to pre-trained segmentation model weights (.pth).")
     parser.add_argument("--real_masks_path", type=str, default=None, help="[Required for Dice] Path to the directory of real segmentation masks.")
-    parser.add_argument("--aesthetic_model_path", type=str, default="christophschuhmann/improved-aesthetic-predictor", help="HF model name or path for the aesthetic predictor.")
     
     args = parser.parse_args()
 
@@ -61,39 +60,16 @@ def parse_args():
 
     return args
 
-class AestheticPredictor(torch.nn.Module):
-    def __init__(self, model_path):
-        super().__init__()
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(768, 1024),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(1024, 128),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(128, 64),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(64, 16),
-            torch.nn.Linear(16, 1)
-        )
-        state_dict = torch.hub.load_state_dict_from_url(
-            f"https://github.com/christophschuhmann/improved-aesthetic-predictor/blob/main/{os.path.basename(model_path)}?raw=true"
-        )
-        self.mlp.load_state_dict(state_dict)
-
-    def forward(self, x):
-        inputs = self.processor(images=x, return_tensors="pt")
-        inputs = {k: v.to(self.clip_model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            embed = self.clip_model.get_image_features(**inputs)
-            embed = embed / torch.linalg.norm(embed, dim=-1, keepdim=True)
-        return self.mlp(embed.float())
-
-
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+
+    # Define a transform to resize real images to match the generated size (512x512)
+    image_transform = transforms.Compose([
+        transforms.Resize((512, 512), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor()
+    ])
 
     # --- 1. Generate Images (if they don't exist) ---
     generated_images_path = Path(args.output_path)
@@ -140,15 +116,13 @@ def main():
         kid = KernelInceptionDistance(subset_size=50, normalize=True).to(device) # subset_size should be smaller than num_samples
         ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
         psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
-        aesthetic_scorer = AestheticPredictor(args.aesthetic_model_path).to(device).eval()
-        total_aesthetic_score = 0.0
 
     # Dice/Segmentation metrics
     if args.seg_model_weights:
         seg_model = smp.Unet(encoder_name="resnet34", in_channels=1, classes=1).to(device)
         seg_model.load_state_dict(torch.load(args.seg_model_weights, map_location=device))
         seg_model.eval()
-        dice = Dice(average='micro').to(device)
+        dice_metric = dice(average='micro').to(device)
         real_mask_files = sorted(list(Path(args.real_masks_path).rglob("*.png")))[:args.num_samples]
         if len(real_mask_files) != len(real_image_files):
             raise ValueError("Number of real images and real masks must be the same for Dice score calculation.")
@@ -158,7 +132,9 @@ def main():
     real_images_tensors = []
     for file_path in tqdm(real_image_files):
         img = Image.open(file_path).convert("RGB")
-        img_tensor = _pil_to_tensor(img).to(device) # Shape: [C, H, W]
+        # Use the transform that includes resizing to 512x512
+        img_tensor = image_transform(img).to(device)
+        
         # Torchmetrics FID/IS/KID expect [N, C, H, W] and uint8 [0, 255]
         fid.update((img_tensor.unsqueeze(0) * 255).to(torch.uint8), real=True)
         if args.calculate_extended_metrics:
@@ -183,10 +159,6 @@ def main():
             ssim.update(img_tensor.unsqueeze(0), real_images_tensors[i].unsqueeze(0))
             psnr.update(img_tensor.unsqueeze(0), real_images_tensors[i].unsqueeze(0))
 
-            # Update aesthetic score
-            with torch.no_grad():
-                total_aesthetic_score += aesthetic_scorer(img).item()
-
         # Update Dice score
         if args.seg_model_weights:
             # Get predicted mask from generated image
@@ -198,7 +170,7 @@ def main():
             # Load ground truth mask
             gt_mask_img = Image.open(real_mask_files[i]).convert("L")
             gt_mask_tensor = (transforms.ToTensor()(gt_mask_img) > 0.5).int().to(device)
-            dice.update(pred_mask, gt_mask_tensor)
+            dice_metric.update(pred_mask, gt_mask_tensor)
 
     # --- 4. Compute and Display Final Scores ---
     print("\n--- Evaluation Results ---")
@@ -222,11 +194,8 @@ def main():
         final_psnr = psnr.compute()
         print(f"Peak Signal-to-Noise Ratio (PSNR): {final_psnr.item():.4f} (Higher is better)")
 
-        avg_aesthetic_score = total_aesthetic_score / args.num_samples
-        print(f"Average Aesthetic Score: {avg_aesthetic_score:.4f} (Higher is better, typically 1-10)")
-
     if args.seg_model_weights:
-        final_dice = dice.compute()
+        final_dice = dice_metric.compute()
         print(f"Dice Score (Segmentation Accuracy): {final_dice.item():.4f} (Higher is better)")
         
     print("--------------------------\n")
