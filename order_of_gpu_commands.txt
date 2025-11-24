@@ -13,4 +13,16 @@ kaggle datasets download -d nih-chest-xrays/sample
 sudo apt install unzip
 unzip sample.zip
 pip install pandas torch opencv-python torchvision diffusers transformers peft matplotlib
+
 sudo apt-get install libgl1 
+
+
+python train_dreambooth_holistic_loss.py \
+  --instance_data_dir="./instance_images" \
+  --instance_mask_dir="./instance_masks" \
+  --output_dir="./result_model" \
+  --seg_model_weights="./seg_weights.pth" \
+  --instance_prompt="a photo of <nih-xray>" \
+  --class_prompt="a photo of x-ray" \
+  --num_epochs=10 \
+  --batch_size=1
