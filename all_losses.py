@@ -1,15 +1,14 @@
-# train_dreambooth_holistic_loss.py
+# train_dreambooth_complete_loss.py
 
 import os
 import argparse
 import itertools
 import torch
-import re
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from torchvision.models import vgg16, VGG16_Weights
+import torch.nn as nn
 import torch.nn.functional as F
+import re
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel, DDPMScheduler, AutoencoderKL
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -21,99 +20,179 @@ from monai.losses import DiceLoss
 import segmentation_models_pytorch as smp
 from torch.utils.tensorboard import SummaryWriter
 
-# --- NEW LOSS CLASSES ---
+# --- NEW LOSS HELPER CLASSES ---
 
-class VGGPerceptualLoss(torch.nn.Module):
-    """Computes Perceptual Loss using VGG16 features."""
+class PerceptualLoss(nn.Module):
+    """VGG-based Perceptual Loss."""
     def __init__(self, device):
         super().__init__()
-        # Load VGG16, drop the classifier, use only features
-        self.vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features[:16].to(device).eval()
-        for param in self.vgg.parameters():
-            param.requires_grad = False
+        vgg = models.vgg16(pretrained=True).features
+        # Extract features from specific layers (relu1_2, relu2_2, relu3_3, relu4_3)
+        self.slice1 = torch.nn.Sequential()
+        self.slice2 = torch.nn.Sequential()
+        self.slice3 = torch.nn.Sequential()
+        self.slice4 = torch.nn.Sequential()
+        for x in range(4):
+            self.slice1.add_module(str(x), vgg[x])
+        for x in range(4, 9):
+            self.slice2.add_module(str(x), vgg[x])
+        for x in range(9, 16):
+            self.slice3.add_module(str(x), vgg[x])
+        for x in range(16, 23):
+            self.slice4.add_module(str(x), vgg[x])
         
-        # ImageNet normalization statistics
+        self.slice1.eval()
+        self.slice2.eval()
+        self.slice3.eval()
+        self.slice4.eval()
+        
+        for param in self.parameters():
+            param.requires_grad = False
+            
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
 
     def forward(self, input, target):
-        # Input is [-1, 1], convert to [0, 1] for VGG
-        input = (input + 1) / 2
-        target = (target + 1) / 2
-        
-        # Normalize for VGG
+        # Input/Target are [0, 1]. Normalize for VGG.
         input = (input - self.mean) / self.std
         target = (target - self.mean) / self.std
         
-        input_features = self.vgg(input)
-        target_features = self.vgg(target)
-        return F.mse_loss(input_features, target_features)
+        h_x = input
+        h_y = target
+        loss = 0.0
+        
+        h_x = self.slice1(h_x)
+        h_y = self.slice1(h_y)
+        loss += F.mse_loss(h_x, h_y)
+        
+        h_x = self.slice2(h_x)
+        h_y = self.slice2(h_y)
+        loss += F.mse_loss(h_x, h_y)
+        
+        h_x = self.slice3(h_x)
+        h_y = self.slice3(h_y)
+        loss += F.mse_loss(h_x, h_y)
+        
+        h_x = self.slice4(h_x)
+        h_y = self.slice4(h_y)
+        loss += F.mse_loss(h_x, h_y)
+        
+        return loss
 
-def compute_edge_loss(pred, target):
-    """Computes loss based on Laplacian Edge Detection."""
-    # Convert to grayscale for edge detection
-    if pred.shape[1] == 3:
-        weights = torch.tensor([0.299, 0.587, 0.114], device=pred.device).view(1, 3, 1, 1)
-        pred_gray = (pred * weights).sum(dim=1, keepdim=True)
-        target_gray = (target * weights).sum(dim=1, keepdim=True)
-    else:
-        pred_gray = pred
-        target_gray = target
+class EdgeLoss(nn.Module):
+    """Sobel-based Edge/Gradient Loss."""
+    def __init__(self, device):
+        super().__init__()
+        # Sobel kernels
+        self.kx = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3).to(device)
+        self.ky = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3).to(device)
 
-    # Laplacian Kernel
-    kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=pred.device)
-    
-    pred_edges = F.conv2d(pred_gray, kernel, padding=1)
-    target_edges = F.conv2d(target_gray, kernel, padding=1)
-    
-    return F.mse_loss(pred_edges, target_edges)
+    def forward(self, input, target):
+        # Convert RGB to Grayscale for edge detection
+        if input.shape[1] == 3:
+            input_gray = 0.299 * input[:, 0, :, :] + 0.587 * input[:, 1, :, :] + 0.114 * input[:, 2, :, :]
+            target_gray = 0.299 * target[:, 0, :, :] + 0.587 * target[:, 1, :, :] + 0.114 * target[:, 2, :, :]
+            input_gray = input_gray.unsqueeze(1)
+            target_gray = target_gray.unsqueeze(1)
+        else:
+            input_gray = input
+            target_gray = target
 
-def compute_freq_loss(pred, target):
-    """Computes Frequency Loss using FFT."""
-    # FFT requires real inputs
-    pred_fft = torch.fft.rfft2(pred)
-    target_fft = torch.fft.rfft2(target)
-    
-    # Compare magnitude spectra
-    loss = F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
-    return loss
+        pred_gx = F.conv2d(input_gray, self.kx, padding=1)
+        pred_gy = F.conv2d(input_gray, self.ky, padding=1)
+        gt_gx = F.conv2d(target_gray, self.kx, padding=1)
+        gt_gy = F.conv2d(target_gray, self.ky, padding=1)
 
-# ------------------------
+        loss = F.l1_loss(pred_gx, gt_gx) + F.l1_loss(pred_gy, gt_gy)
+        return loss
+
+class FrequencyLoss(nn.Module):
+    """Frequency/Spectrum Loss using FFT."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input, target):
+        # FFT2 returns complex tensor
+        fft_input = torch.fft.rfft2(input, norm='ortho')
+        fft_target = torch.fft.rfft2(target, norm='ortho')
+        
+        # Compare magnitude (spectrum)
+        diff = torch.abs(fft_input) - torch.abs(fft_target)
+        return torch.mean(diff ** 2)
+
+class RadiomicsLoss(nn.Module):
+    """Differentiable First-Order Radiomics (Statistics) Loss."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input, target):
+        # Calculate First Order Statistics: Mean, Variance, Skewness, Kurtosis
+        # Input assumed [B, C, H, W]
+        
+        def get_moments(img):
+            # Flatten spatial dims
+            x = img.view(img.size(0), img.size(1), -1)
+            mean = torch.mean(x, dim=2, keepdim=True)
+            var = torch.var(x, dim=2, keepdim=True, unbiased=False)
+            std = torch.sqrt(var + 1e-6)
+            
+            # Skewness
+            centered = x - mean
+            skew = torch.mean(centered ** 3, dim=2, keepdim=True) / (std ** 3 + 1e-6)
+            
+            # Kurtosis
+            kurt = torch.mean(centered ** 4, dim=2, keepdim=True) / (std ** 4 + 1e-6)
+            
+            return mean.squeeze(), var.squeeze(), skew.squeeze(), kurt.squeeze()
+
+        pred_mean, pred_var, pred_skew, pred_kurt = get_moments(input)
+        gt_mean, gt_var, gt_skew, gt_kurt = get_moments(target)
+        
+        # Weighted sum of statistical differences
+        loss_mean = F.mse_loss(pred_mean, gt_mean)
+        loss_var = F.mse_loss(pred_var, gt_var)
+        loss_skew = F.mse_loss(pred_skew, gt_skew)
+        loss_kurt = F.mse_loss(pred_kurt, gt_kurt)
+        
+        return loss_mean + loss_var + 0.5 * loss_skew + 0.5 * loss_kurt
+
+# -----------------------------
 
 def parse_args():
     """Parses command-line arguments."""
-    parser = argparse.ArgumentParser(description="DreamBooth fine-tuning with Holistic Loss Function.")
+    parser = argparse.ArgumentParser(description="DreamBooth fine-tuning with a combined Multi-Objective loss.")
     
     # Core DreamBooth arguments
     parser.add_argument("--model_id", type=str, default="stabilityai/stable-diffusion-2-base", help="Pretrained model ID.")
     parser.add_argument("--instance_data_dir", type=str, required=True, help="Path to your training images.")
-    parser.add_argument("--output_dir", type=str, default="./results_holistic", help="Directory to save the model and logs.")
+    parser.add_argument("--output_dir", type=str, default="./results_dreambooth_combined", help="Directory to save the model and logs.")
     parser.add_argument("--unique_token", type=str, default="<nih-xray>", help="Unique token for your concept.")
     
-    # Prior Preservation arguments (The 'Cls' Loss)
+    # Prior Preservation arguments
     parser.add_argument("--class_token", type=str, default="x-ray", help="General class for prior preservation.")
     parser.add_argument("--class_data_dir", type=str, default="./class_images_xray", help="Directory to cache generated class images.")
     parser.add_argument("--num_class_images", type=int, default=200, help="Number of class images for prior preservation.")
-    parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="Weight for prior preservation loss (Cls).")
+    parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="Weight for prior preservation loss (cls).")
     
     # Training hyperparameters
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument("--learning_rate", type=float, default=2e-6, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=1, help="Training batch size.")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients before updating.")
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
 
-    # Segmentation (Dice) Args
-    parser.add_argument("--instance_mask_dir", type=str, required=True, help="Path to training segmentation masks.")
+    # Segmentation (Dice) Loss specific arguments
+    parser.add_argument("--instance_mask_dir", type=str, required=True, help="Path to your training segmentation masks.")
     parser.add_argument("--seg_model_weights", type=str, required=True, help="Path to pre-trained segmentation model weights.")
+    parser.add_argument("--seg_loss_weight", type=float, default=0.3, help="Weight for the Segmentation aware (Dice) loss [0.1-0.5].")
     
-    # --- WEIGHTS FOR NEW LOSSES ---
-    parser.add_argument("--weight_seg", type=float, default=0.1, help="Weight for Segmentation (Dice) loss.")
-    parser.add_argument("--weight_ssim", type=float, default=0.1, help="Weight for SSIM loss.")
-    parser.add_argument("--weight_pix", type=float, default=0.2, help="Weight for Pixel Reconstruction (L1/MSE) loss.")
-    parser.add_argument("--weight_perc", type=float, default=0.1, help="Weight for Perceptual (VGG) loss.")
-    parser.add_argument("--weight_edge", type=float, default=0.1, help="Weight for Edge/Gradient loss.")
-    parser.add_argument("--weight_freq", type=float, default=0.1, help="Weight for Frequency/Spectrum loss.")
+    # NEW LOSS WEIGHTS
+    parser.add_argument("--pix_loss_weight", type=float, default=0.2, help="Weight for Pixel reconstruction loss [0.05-0.5].")
+    parser.add_argument("--perc_loss_weight", type=float, default=0.1, help="Weight for Perceptual loss [0.05-0.3].")
+    parser.add_argument("--ssim_loss_weight", type=float, default=0.05, help="Weight for SSIM loss [0.01-0.1].")
+    parser.add_argument("--edge_loss_weight", type=float, default=0.1, help="Weight for Edge/Gradient loss.")
+    parser.add_argument("--freq_loss_weight", type=float, default=0.1, help="Weight for Frequency/Spectrum loss.")
+    parser.add_argument("--rad_loss_weight", type=float, default=0.1, help="Weight for Radiomics Feature loss.")
     
     return parser.parse_args()
 
@@ -195,22 +274,28 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
+    # Initialize TensorBoard Writer
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "logs"))
 
-    # --- 1. SETUP AUXILIARY MODELS ---
+    # --- 1. SETUP LOSS FUNCTIONS AND MODELS ---
+    print("Initializing Multi-Objective Loss components...")
     
-    # Segmentation (Seg)
-    print("Loading segmentation model...")
+    # Segmentation Model (Dice)
     seg_model = smp.Unet(encoder_name="resnet34", in_channels=1, classes=1).to(device)
     seg_model.load_state_dict(torch.load(args.seg_model_weights, map_location=device))
     seg_model.eval()
-    for param in seg_model.parameters(): param.requires_grad = False
+    for param in seg_model.parameters():
+        param.requires_grad = False
     dice_loss_fn = DiceLoss(sigmoid=True)
     
-    # Perceptual (Perc)
-    print("Loading VGG for perceptual loss...")
-    perceptual_loss_fn = VGGPerceptualLoss(device)
-
+    # New Loss Modules
+    perceptual_loss_fn = PerceptualLoss(device).to(device)
+    edge_loss_fn = EdgeLoss(device).to(device)
+    freq_loss_fn = FrequencyLoss().to(device)
+    radiomics_loss_fn = RadiomicsLoss().to(device)
+    
+    print("Loss components initialized.")
+    
     # --- 2. SETUP DIFFUSION MODEL COMPONENTS ---
     instance_prompt = f"a photo of {args.unique_token}"
     class_prompt = f"a photo of a {args.class_token}"
@@ -239,11 +324,11 @@ def main():
     unet.enable_gradient_checkpointing()
     try:
         unet.enable_xformers_memory_efficient_attention()
-        print("xFormers enabled.")
+        print("xFormers enabled for memory efficiency.")
     except ImportError:
-        pass
+        print("xFormers is not installed. For better memory efficiency, consider installing it.")
 
-    # --- 3. GENERATE CLASS IMAGES ---
+    # --- 3. GENERATE CLASS IMAGES IF NEEDED ---
     num_current_class_images = len(os.listdir(args.class_data_dir))
     if num_current_class_images < args.num_class_images:
         print(f"Generating {args.num_class_images - num_current_class_images} class images...")
@@ -275,33 +360,61 @@ def main():
     
     scaler = torch.cuda.amp.GradScaler()
 
-    # Resume Logic (Condensed)
+    # --- CHECK FOR CHECKPOINTS AND RESUME ---
     initial_epoch = 0
-    global_step = 0
+    global_step_resume = 0
     if os.path.isdir(args.output_dir):
         checkpoint_dirs = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")]
         if checkpoint_dirs:
-            # Sort loosely by number
-            checkpoint_dirs.sort(key=lambda x: int(x.split('-')[1]))
-            latest_dir = checkpoint_dirs[-1]
-            state_file = os.path.join(args.output_dir, latest_dir, "training_state.pth")
-            if os.path.isfile(state_file):
-                print(f"Resuming from {state_file}")
-                cp = torch.load(state_file, map_location=device)
-                unet.load_state_dict(cp['unet_state_dict'])
-                text_encoder.load_state_dict(cp['text_encoder_state_dict'])
-                optimizer.load_state_dict(cp['optimizer_state_dict'])
-                initial_epoch = cp['epoch']
-                global_step = cp['global_step']
+            latest_epoch = -1
+            latest_checkpoint_dir = None
+            for d in checkpoint_dirs:
+                try:
+                    epoch_num = int(re.search(r'checkpoint-(\d+)', d).group(1))
+                    if epoch_num > latest_epoch:
+                        state_file = os.path.join(args.output_dir, d, "training_state.pth")
+                        if os.path.isfile(state_file):
+                            latest_epoch = epoch_num
+                            latest_checkpoint_dir = d
+                except (AttributeError, ValueError):
+                    continue
+            
+            if latest_checkpoint_dir:
+                checkpoint_path = os.path.join(args.output_dir, latest_checkpoint_dir)
+                training_state_path = os.path.join(checkpoint_path, "training_state.pth")
+                
+                print(f"Resuming training from checkpoint: {checkpoint_path}")
+                
+                try:
+                    checkpoint = torch.load(training_state_path, map_location=device)
+                    
+                    unet.load_state_dict(checkpoint['unet_state_dict'])
+                    text_encoder.load_state_dict(checkpoint['text_encoder_state_dict'])
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+                    scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                    
+                    initial_epoch = checkpoint['epoch']
+                    global_step_resume = checkpoint['global_step']
+                    
+                    print(f"Successfully resumed from epoch {initial_epoch} at global step {global_step_resume}.")
+
+                except Exception as e:
+                    print(f"Could not load training state from {training_state_path}: {e}")
+                    print("Starting training from scratch.")
+                    initial_epoch = 0
+                    global_step_resume = 0
+            else:
+                print("No valid 'training_state.pth' found in checkpoint directories. Starting from scratch.")
 
     # --- 5. TRAINING LOOP ---
+    global_step = global_step_resume
     for epoch in range(initial_epoch, args.num_epochs):
         unet.train()
         text_encoder.train()
         progress_bar = tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}")
 
         for step, batch in enumerate(train_dataloader):
-            # 1. Base Diffusion Process (DDPM)
             with torch.no_grad():
                 latents = vae.encode(batch["pixel_values"].to(device, dtype=torch.float32)).latent_dist.sample() * vae.config.scaling_factor
 
@@ -310,23 +423,19 @@ def main():
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             with torch.cuda.amp.autocast():
+                # --- DDPM LOSS (Base) ---
                 encoder_hidden_states = text_encoder(batch["input_ids"].to(device))[0]
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                 
                 noise_pred_instance, noise_pred_class = noise_pred.chunk(2, dim=0)
                 noise_instance, noise_class = noise.chunk(2, dim=0)
+                instance_loss = torch.nn.functional.mse_loss(noise_pred_instance.float(), noise_instance.float())
+                class_loss = torch.nn.functional.mse_loss(noise_pred_class.float(), noise_class.float())
                 
-                # Loss 1: DDPM Instance Loss
-                loss_ddpm_inst = torch.nn.functional.mse_loss(noise_pred_instance.float(), noise_instance.float())
-                
-                # Loss 2: Cls (Prior Preservation) Loss
-                loss_cls = torch.nn.functional.mse_loss(noise_pred_class.float(), noise_class.float())
-                
-                loss_dreambooth = loss_ddpm_inst + args.prior_loss_weight * loss_cls
+                # ddpm + cls
+                dreambooth_loss = instance_loss + args.prior_loss_weight * class_loss
 
-                # --- RECONSTRUCTION FOR AUXILIARY LOSSES ---
-                # To compute Pix, Perc, Edge, Freq, SSIM, Seg, we must decode the predicted latents.
-                # Use the analytic scheduler approximation (x_0 prediction)
+                # --- RECONSTRUCT X0 FOR IMAGE-SPACE LOSSES ---
                 alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
                 sqrt_alpha_prod = alphas_cumprod[timesteps]**0.5
                 sqrt_alpha_prod = sqrt_alpha_prod.flatten()
@@ -338,70 +447,81 @@ def main():
                 while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_latents.shape):
                     sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
                 
-                # Predicted Original Latent (x_0)
                 pred_original_sample = (noisy_latents - sqrt_one_minus_alpha_prod * noise_pred) / sqrt_alpha_prod
                 pred_instance_latents, _ = pred_original_sample.chunk(2, dim=0)
 
-                # Decode to Image Space
                 pred_images = vae.decode(pred_instance_latents / vae.config.scaling_factor, return_dict=False)[0]
-                
-                # Get Ground Truth Instance Images
+
+                # Prepare Images: GT vs Pred (Normalized to [0,1] for most losses)
                 pixel_values_instance, _ = batch["pixel_values"].to(device).chunk(2, dim=0)
+                pred_images_norm = (pred_images + 1) / 2
+                pixel_values_instance_norm = (pixel_values_instance + 1) / 2
                 
-                # Normalize to [0, 1] for metric calculations where needed
-                pred_images_norm = torch.clamp((pred_images + 1) / 2, 0, 1)
-                gt_images_norm = torch.clamp((pixel_values_instance + 1) / 2, 0, 1)
-
-                # --- AUXILIARY LOSSES ---
+                # --- CALCULATE AUXILIARY LOSSES ---
                 
-                # Loss 3: SSIM
-                val_ssim = ssim(pred_images_norm, gt_images_norm, data_range=1.0)
-                loss_ssim = 1.0 - val_ssim
+                # 1. SSIM Loss
+                ssim_val = ssim(pred_images_norm, pixel_values_instance_norm, data_range=1.0)
+                ssim_loss = 1.0 - ssim_val
 
-                # Loss 4: Seg (Dice Loss)
+                # 2. Pixel Reconstruction Loss (pix)
+                pix_loss = F.mse_loss(pred_images_norm, pixel_values_instance_norm)
+
+                # 3. Perceptual Loss (perc)
+                perc_loss = perceptual_loss_fn(pred_images_norm, pixel_values_instance_norm)
+
+                # 4. Edge/Gradient Loss (edge)
+                edge_loss = edge_loss_fn(pred_images_norm, pixel_values_instance_norm)
+
+                # 5. Frequency/Spectrum Loss (freq)
+                freq_loss = freq_loss_fn(pred_images_norm, pixel_values_instance_norm)
+
+                # 6. Radiomics Feature Loss (rad)
+                rad_loss = radiomics_loss_fn(pred_images_norm, pixel_values_instance_norm)
+
+                # 7. Segmentation Aware Loss (seg)
                 gt_masks = batch["masks"].to(device)
-                pred_images_gray = transforms.functional.rgb_to_grayscale(pred_images) # for UNet
+                pred_images_gray = transforms.functional.rgb_to_grayscale(pred_images)
                 pred_mask_logits = seg_model(pred_images_gray)
-                loss_seg = dice_loss_fn(pred_mask_logits, gt_masks)
+                seg_loss = dice_loss_fn(pred_mask_logits, gt_masks)
                 
-                # Loss 5: Pix (Pixel Reconstruction L1)
-                loss_pix = torch.nn.functional.l1_loss(pred_images, pixel_values_instance)
-                
-                # Loss 6: Perc (Perceptual VGG)
-                loss_perc = perceptual_loss_fn(pred_images, pixel_values_instance)
-
-                # Loss 7: Edge (Gradient Loss)
-                loss_edge = compute_edge_loss(pred_images_norm, gt_images_norm)
-
-                # Loss 8: Freq (Frequency Loss)
-                loss_freq = compute_freq_loss(pred_images, pixel_values_instance)
-
-                # --- TOTAL LOSS AGGREGATION ---
+                # --- COMBINE LOSSES ---
                 total_loss = (
-                    loss_dreambooth + 
-                    (args.weight_ssim * loss_ssim) +
-                    (args.weight_seg * loss_seg) +
-                    (args.weight_pix * loss_pix) +
-                    (args.weight_perc * loss_perc) +
-                    (args.weight_edge * loss_edge) +
-                    (args.weight_freq * loss_freq)
+                    dreambooth_loss + 
+                    args.ssim_loss_weight * ssim_loss + 
+                    args.seg_loss_weight * seg_loss +
+                    args.pix_loss_weight * pix_loss +
+                    args.perc_loss_weight * perc_loss +
+                    args.edge_loss_weight * edge_loss +
+                    args.freq_loss_weight * freq_loss +
+                    args.rad_loss_weight * rad_loss
                 )
+                
+                # --- TENSORBOARD LOGGING ---
+                writer.add_scalar("Loss/total", total_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/dreambooth_ddpm_cls", dreambooth_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/ssim", ssim_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/seg_dice", seg_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/pix", pix_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/perc", perc_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/edge", edge_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/freq", freq_loss.detach().item(), global_step)
+                writer.add_scalar("Loss/rad", rad_loss.detach().item(), global_step)
+                
+                writer.add_scalar("Metric/SSIM_Score", ssim_val.detach().item(), global_step)
+                writer.add_scalar("LearningRate", lr_scheduler.get_last_lr()[0], global_step)
+                
+                # Calculate and log Dice Score metric
+                with torch.no_grad():
+                    pred_masks_prob = torch.sigmoid(pred_mask_logits)
+                    intersection = torch.sum(pred_masks_prob * gt_masks)
+                    union = torch.sum(pred_masks_prob) + torch.sum(gt_masks)
+                    dice_score = (2. * intersection) / (union + 1e-6)
+                    writer.add_scalar("Metric/Dice_Score", dice_score.item(), global_step)
+                # --- END OF LOGGING ---
+                
+                loss = total_loss / args.gradient_accumulation_steps
 
-                # --- LOGGING ---
-                writer.add_scalar("Loss/Total", total_loss.item(), global_step)
-                writer.add_scalar("Loss/DDPM_Inst", loss_ddpm_inst.item(), global_step)
-                writer.add_scalar("Loss/Cls_Prior", loss_cls.item(), global_step)
-                writer.add_scalar("Loss/SSIM", loss_ssim.item(), global_step)
-                writer.add_scalar("Loss/Seg_Dice", loss_seg.item(), global_step)
-                writer.add_scalar("Loss/Pix_L1", loss_pix.item(), global_step)
-                writer.add_scalar("Loss/Perc_VGG", loss_perc.item(), global_step)
-                writer.add_scalar("Loss/Edge", loss_edge.item(), global_step)
-                writer.add_scalar("Loss/Freq", loss_freq.item(), global_step)
-                writer.add_scalar("Metric/SSIM", val_ssim.item(), global_step)
-
-                scaled_loss = total_loss / args.gradient_accumulation_steps
-
-            scaler.scale(scaled_loss).backward()
+            scaler.scale(loss).backward()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
@@ -409,31 +529,48 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
             progress_bar.set_postfix(
-                loss=total_loss.item(),
-                ssim=val_ssim.item(),
-                dice=loss_seg.item()
+                loss=loss.detach().item() * args.gradient_accumulation_steps,
+                ssim=ssim_loss.detach().item(),
+                seg=seg_loss.detach().item(),
+                rad=rad_loss.detach().item()
             )
             progress_bar.update(1)
             global_step += 1
 
         progress_bar.close()
 
-        # Save Checkpoint
+        # --- SAVE CHECKPOINT WITH FULL TRAINING STATE ---
         checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{epoch + 1}")
         os.makedirs(checkpoint_dir, exist_ok=True)
-        pipeline = StableDiffusionPipeline.from_pretrained(args.model_id, unet=unet, text_encoder=text_encoder, tokenizer=tokenizer)
-        pipeline.save_pretrained(checkpoint_dir)
         
+        # Save the inference pipeline
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            args.model_id, unet=unet, text_encoder=text_encoder, tokenizer=tokenizer,
+        )
+        pipeline.save_pretrained(checkpoint_dir)
+        print(f"Saved inference pipeline for epoch {epoch + 1} at {checkpoint_dir}")
+        
+        # Save the complete training state
         training_state = {
-            'epoch': epoch + 1, 'global_step': global_step,
-            'unet_state_dict': unet.state_dict(), 'text_encoder_state_dict': text_encoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict()
+            'epoch': epoch + 1,
+            'global_step': global_step,
+            'unet_state_dict': unet.state_dict(),
+            'text_encoder_state_dict': text_encoder.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
         }
         torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pth"))
-        print(f"Saved epoch {epoch + 1}")
+        print(f"Saved complete training state for epoch {epoch + 1}")
 
+    # --- 6. SAVE FINAL MODEL ---
     print("Saving final model...")
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.model_id, unet=unet, text_encoder=text_encoder, tokenizer=tokenizer,
+    )
     pipeline.save_pretrained(args.output_dir)
+    print(f"Model saved to {args.output_dir}")
+    
     writer.close()
 
 if __name__ == "__main__":
