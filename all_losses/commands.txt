@@ -1,0 +1,12 @@
+python train_1.py \
+  --model_id="Manojb/stable-diffusion-2-1-base" \
+  --instance_data_dir="./sample/images" \
+  --instance_mask_dir="./nih_masks_png" \
+  --seg_model_weights="best_segmentation_model_50_epochs.pth" \
+  --output_dir="./output_model" \
+  --unique_token="<nih-xray>" \
+  --use_lora \
+  --use_mixed_precision \
+  --gradient_checkpointing \
+  --batch_size=1 \
+  --num_epochs=10
