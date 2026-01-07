@@ -451,8 +451,9 @@ def main():
     
     # Initialize loss functions
     print("Initializing loss functions...")
-    perceptual_fn = PerceptualLoss(device)
-    edge_fn = EdgeLoss(device)
+    # FIXED: Added .to(device) to ensure all buffers are on GPU
+    perceptual_fn = PerceptualLoss(device).to(device)
+    edge_fn = EdgeLoss(device).to(device)
     freq_fn = FrequencyLoss().to(device)
     rad_fn = StableRadiomicsLoss().to(device)
     dice_fn = DiceLoss(sigmoid=True).to(device)
@@ -718,6 +719,11 @@ def main():
                     writer.add_scalar("Loss/SSIM", l_ssim.item(), global_step)
                     writer.add_scalar("Loss/Segmentation", l_seg.item(), global_step)
                     writer.add_scalar("Loss/Pixel", l_pix.item(), global_step)
+                    # FIXED: Added missing metrics
+                    writer.add_scalar("Loss/Perceptual", l_perc.item(), global_step)
+                    writer.add_scalar("Loss/Edge", l_edge.item(), global_step)
+                    writer.add_scalar("Loss/Frequency", l_freq.item(), global_step)
+                    writer.add_scalar("Loss/Radiomics", l_rad.item(), global_step)
             
             # --- CHECKPOINTING ---
             if global_step % args.save_interval == 0 and global_step > 0:
