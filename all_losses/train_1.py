@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel, DDPMScheduler, AutoencoderKL
-from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPTextModel, CLIPTokenizer
 from PIL import Image
@@ -170,7 +169,7 @@ class StableRadiomicsLoss(nn.Module):
 def parse_args():
     parser = argparse.ArgumentParser()
     # Model & Data
-    parser.add_argument("--model_id", type=str, default="stabilityai/stable-diffusion-2-base")
+    parser.add_argument("--model_id", type=str, default="Manojb/stable-diffusion-2-1-base")
     parser.add_argument("--instance_data_dir", type=str, required=True)
     parser.add_argument("--instance_mask_dir", type=str, required=True)
     parser.add_argument("--class_data_dir", type=str, default="./class_images")
@@ -204,8 +203,7 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument("--validation_interval", type=int, default=100)
     parser.add_argument("--use_mixed_precision", action="store_true")
-    parser.add_argument("--use_lora", action="store_true", help="Use LoRA for efficient fine-tuning")
-    parser.add_argument("--lora_rank", type=int, default=4)
+    # REMOVED LoRA ARGS
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing for UNet")
     parser.add_argument("--aux_loss_start_step", type=int, default=1000, help="Step to start auxiliary losses")
     parser.add_argument("--max_aux_timestep", type=int, default=300, help="Max timestep for auxiliary losses (0-1000)")
@@ -360,29 +358,6 @@ def collate_fn(examples, pad_token_id):
         "has_class": examples[0]["class_images"] is not None
     }
 
-def apply_lora(unet, rank=4):
-    """Apply LoRA to UNet attention layers"""
-    lora_attn_procs = {}
-    for name in unet.attn_processors.keys():
-        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
-        
-        lora_attn_procs[name] = LoRAAttnProcessor(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=rank,
-        )
-    
-    unet.set_attn_processor(lora_attn_procs)
-    return unet
-
 def save_checkpoint(unet, text_encoder, tokenizer, optimizer, scheduler, global_step, args, is_final=False):
     """Save model checkpoint"""
     checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
@@ -391,14 +366,6 @@ def save_checkpoint(unet, text_encoder, tokenizer, optimizer, scheduler, global_
     if is_final:
         # Save final pipeline
         save_path = os.path.join(args.output_dir, "final_model")
-        
-        # Handle LoRA if used
-        if args.use_lora:
-            # Merge LoRA weights before saving
-            unet_lora_layers = unet.attn_processors
-            for name, lora_layer in unet_lora_layers.items():
-                if hasattr(lora_layer, "merge"):
-                    lora_layer.merge()
         
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.model_id,
@@ -472,11 +439,6 @@ def main():
         unet.enable_gradient_checkpointing()
         print("Enabled gradient checkpointing for UNet")
     
-    # Apply LoRA if requested
-    if args.use_lora:
-        unet = apply_lora(unet, rank=args.lora_rank)
-        print(f"Applied LoRA with rank {args.lora_rank} to UNet")
-    
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
     
@@ -519,20 +481,11 @@ def main():
     # --- OPTIMIZER AND SCHEDULER ---
     print("Setting up optimizer...")
     
-    # Determine parameters to optimize
+    # Determine parameters to optimize - FULL FINE TUNING
     params_to_optimize = []
     
-    # UNet parameters
-    if args.use_lora:
-        # Only optimize LoRA parameters
-        lora_params = []
-        for name, param in unet.named_parameters():
-            if "lora" in name or "to_k_lora" in name or "to_v_lora" in name or "to_q_lora" in name or "to_out_lora" in name:
-                lora_params.append(param)
-        params_to_optimize.append({"params": lora_params, "lr": args.learning_rate})
-    else:
-        # Optimize all UNet parameters
-        params_to_optimize.append({"params": unet.parameters(), "lr": args.learning_rate})
+    # Optimize all UNet parameters
+    params_to_optimize.append({"params": unet.parameters(), "lr": args.learning_rate})
     
     # Text encoder parameters (usually use lower LR)
     params_to_optimize.append({"params": text_encoder.parameters(), "lr": args.learning_rate * 0.5})
