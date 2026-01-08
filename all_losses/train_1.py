@@ -16,6 +16,7 @@ import bitsandbytes as bnb
 from monai.losses import DiceLoss
 import segmentation_models_pytorch as smp
 from torch.utils.tensorboard import SummaryWriter
+from contextlib import nullcontext  # <--- FIXED: Added this import
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -539,7 +540,8 @@ def main():
             
             # Mixed precision context
             use_amp = scaler is not None
-            ctx = torch.cuda.amp.autocast() if use_amp else torch.no_grad()
+            # FIXED: Used nullcontext instead of torch.no_grad() so standard training works!
+            ctx = torch.cuda.amp.autocast() if use_amp else nullcontext()
             
             with ctx:
                 # --- ENCODE TO LATENTS ---
