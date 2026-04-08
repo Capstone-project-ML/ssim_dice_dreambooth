@@ -7,113 +7,173 @@ from diffusers import StableDiffusionPipeline
 from tqdm.auto import tqdm
 from PIL import Image
 import timm
+from transformers import CLIPProcessor, CLIPModel
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchvision import transforms
 
 # --- CONFIGURATION ---
+# 1. Update these to your Ubuntu server paths
 MODEL_PATH = "./results_seed42/final_model" 
-OUTPUT_DIR = "./eval_output/leakage_fixed_overall"
+OUTPUT_ROOT = "./eval_output/per_class_results"
 UNIQUE_TOKEN = "<nih-xray>" 
 
-# Data paths for unseen data
+# 2. Update to the NEW unseen data paths (from Phase 1 & 2)
 METADATA_CSV_PATH = "./Data_Entry_2017.csv" 
 REAL_IMAGES_ROOT = "./eval_unseen_data/all_images" 
-TRAIN_SAMPLE_CSV = "./sample/sample_labels.csv"
+TRAIN_SAMPLE_CSV = "./sample/sample_labels.csv" # To prevent leakage
 
-NUM_TEST_SAMPLES = 1000 # Standard for a robust FID score
+NUM_IMAGES_PER_CLASS = 100 # Adjusted for per-class consistency
 BATCH_SIZE = 4       
 EVAL_BATCH_SIZE = 32 
+
+PATHOLOGIES = {
+    "Atelectasis":  f"A photo of {UNIQUE_TOKEN} showing Atelectasis",
+    "Cardiomegaly": f"A photo of {UNIQUE_TOKEN} showing Cardiomegaly",
+    "Effusion":     f"A photo of {UNIQUE_TOKEN} showing Effusion",
+    "Infiltration": f"A photo of {UNIQUE_TOKEN} showing Infiltration",
+    "Mass":         f"A photo of {UNIQUE_TOKEN} showing a Mass",
+    "Nodule":       f"A photo of {UNIQUE_TOKEN} showing a Nodule",
+    "Pneumonia":    f"A photo of {UNIQUE_TOKEN} showing Pneumonia",
+    "Pneumothorax": f"A photo of {UNIQUE_TOKEN} showing Pneumothorax",
+    "Consolidation": f"A photo of {UNIQUE_TOKEN} showing Consolidation",
+    "No Finding":   f"A photo of {UNIQUE_TOKEN} with No Findings"
+}
 
 class MedicalEvaluator:
     def __init__(self, device):
         self.device = device
-        # DINO for feature similarity
+        print(f"Initializing Metrics on {device}...")
+        
+        # DINO - Excellent for medical image feature similarity
         self.dino_model = timm.create_model('vit_small_patch16_224.dino', pretrained=True).eval().to(device)
         self.dino_transform = transforms.Compose([
             transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ])
-        # FID for distribution quality
+        
+        # CLIP - Measures how well the pathology matches the prompt
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").eval().to(device)
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        
+        # FID - Standard metric for image quality/diversity
         self.fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
 
-    def get_dino_features(self, image_paths):
+    def get_features_batched(self, image_paths, model_type="dino"):
         all_features = []
         for i in range(0, len(image_paths), EVAL_BATCH_SIZE):
             batch_paths = image_paths[i:i + EVAL_BATCH_SIZE]
             batch_pil = [Image.open(p).convert("RGB") for p in batch_paths]
+            
             with torch.no_grad():
-                tensors = torch.stack([self.dino_transform(img) for img in batch_pil]).to(self.device)
-                feats = self.dino_model(tensors)
+                if model_type == "dino":
+                    tensors = torch.stack([self.dino_transform(img) for img in batch_pil]).to(self.device)
+                    feats = self.dino_model(tensors)
+                elif model_type == "clip":
+                    inputs = self.clip_processor(images=batch_pil, return_tensors="pt", padding=True).to(self.device)
+                    feats = self.clip_model.get_image_features(**inputs)
+            
             all_features.append(feats.cpu())
             torch.cuda.empty_cache()
+            
         return F.normalize(torch.cat(all_features).to(self.device), dim=-1)
 
-    def update_fid(self, image_paths, is_real):
+    def update_fid_batched(self, image_paths, is_real):
         to_tensor = transforms.ToTensor()
         for i in range(0, len(image_paths), EVAL_BATCH_SIZE):
             batch_paths = image_paths[i:i + EVAL_BATCH_SIZE]
             batch_pil = [Image.open(p).convert("RGB") for p in batch_paths]
             batch_tensors = torch.stack([to_tensor(img) for img in batch_pil]).to(self.device)
-            self.fid.update((batch_tensors * 255).byte(), real=is_real)
+            batch_uint8 = (batch_tensors * 255).byte()
+            self.fid.update(batch_uint8, real=is_real)
             torch.cuda.empty_cache()
+
+    def compute_metrics(self, gen_paths, real_paths, prompt):
+        print("    Computing DINO...")
+        real_dino = self.get_features_batched(real_paths, "dino")
+        gen_dino = self.get_features_batched(gen_paths, "dino")
+        sim_matrix = torch.mm(gen_dino, real_dino.transpose(0, 1))
+        dino_score = sim_matrix.mean().item()
+        
+        print("    Computing CLIP-T...")
+        gen_clip = self.get_features_batched(gen_paths, "clip")
+        with torch.no_grad():
+            inputs = self.clip_processor(text=[prompt], return_tensors="pt", padding=True).to(self.device)
+            prompt_feat = F.normalize(self.clip_model.get_text_features(**inputs), dim=-1)
+        clip_t_score = F.cosine_similarity(gen_clip, prompt_feat).mean().item()
+        
+        print("    Computing FID...")
+        self.fid.reset()
+        self.update_fid_batched(real_paths, is_real=True)
+        self.update_fid_batched(gen_paths, is_real=False)
+        fid_score = self.fid.compute().item()
+        
+        return {"DINO": dino_score, "FID": fid_score, "CLIP-T": clip_t_score}
+
+def get_clean_real_images(df, training_df, pathology, root_dir):
+    """Crucial: Filters out images used during training to fix leakage"""
+    training_ids = set(training_df['Image Index'].tolist())
+    # Exclude training IDs
+    unseen_df = df[~df['Image Index'].isin(training_ids)]
+    # Filter for pathology
+    subset = unseen_df[unseen_df['Finding Labels'].str.contains(pathology, na=False)]
+    
+    found_paths = []
+    for fname in subset['Image Index']:
+        path = os.path.join(root_dir, fname)
+        if os.path.exists(path):
+            found_paths.append(path)
+            if len(found_paths) >= NUM_IMAGES_PER_CLASS:
+                break
+    return found_paths
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
     
-    # 1. IDENTIFY UNSEEN IMAGES
-    full_df = pd.read_csv(METADATA_CSV_PATH)
+    print("Loading Metadata and Training Logs (for Leakage Protection)...")
+    df = pd.read_csv(METADATA_CSV_PATH)
     train_df = pd.read_csv(TRAIN_SAMPLE_CSV)
-    train_ids = set(train_df['Image Index'].tolist())
     
-    # Find images in the new folder that were NOT in training
-    all_unseen_files = [f for f in os.listdir(REAL_IMAGES_ROOT) if f not in train_ids]
-    real_paths = [os.path.join(REAL_IMAGES_ROOT, f) for f in all_unseen_files[:NUM_TEST_SAMPLES]]
-    
-    print(f"Total Unseen images identified: {len(all_unseen_files)}")
-    print(f"Using {len(real_paths)} images for reference.")
-
-    # 2. LOAD MODEL
+    print(f"Loading Model...")
     pipeline = StableDiffusionPipeline.from_pretrained(MODEL_PATH, torch_dtype=torch.float16).to(device)
+    pipeline.set_progress_bar_config(disable=True)
     
-    # 3. GENERATE SAMPLES
-    gen_dir = Path(OUTPUT_DIR) / "generated_samples"
-    gen_dir.mkdir(exist_ok=True)
-    
-    print(f"Generating {NUM_TEST_SAMPLES} synthetic images...")
-    prompt = f"a photo of {UNIQUE_TOKEN}"
-    generator = torch.manual_seed(42)
-    
-    for i in tqdm(range(0, NUM_TEST_SAMPLES, BATCH_SIZE)):
-        curr_batch = min(BATCH_SIZE, NUM_TEST_SAMPLES - i)
-        imgs = pipeline([prompt]*curr_batch, generator=generator).images
-        for j, img in enumerate(imgs):
-            img.save(gen_dir / f"gen_{i+j:05d}.png")
-
-    # 4. CALCULATE METRICS
     evaluator = MedicalEvaluator(device)
-    gen_paths = sorted(list(gen_dir.glob("*.png")))
+    results = []
     
-    print("Calculating overall FID...")
-    evaluator.update_fid(real_paths, is_real=True)
-    evaluator.update_fid(gen_paths, is_real=False)
-    fid_val = evaluator.fid.compute().item()
-    
-    print("Calculating overall DINO Similarity...")
-    real_feats = evaluator.get_dino_features(real_paths)
-    gen_feats = evaluator.get_dino_features(gen_paths)
-    dino_val = torch.mm(gen_feats, real_feats.transpose(0, 1)).mean().item()
+    for pathology, prompt in PATHOLOGIES.items():
+        print(f"\n--- Class: {pathology} ---")
+        class_out_dir = Path(OUTPUT_ROOT) / pathology
+        class_out_dir.mkdir(parents=True, exist_ok=True)
+        
+        real_paths = get_clean_real_images(df, train_df, pathology, REAL_IMAGES_ROOT)
+        if len(real_paths) < 10:
+            print(f"Skipping {pathology}: Insufficient unseen images ({len(real_paths)})")
+            continue
 
-    # 5. SAVE RESULTS
-    with open(os.path.join(OUTPUT_DIR, "overall_results.txt"), "w") as f:
-        f.write(f"Overall Evaluation (Data Leakage Fixed)\n")
-        f.write(f"Reference Images: {len(real_paths)} (Strictly Unseen)\n")
-        f.write(f"Generated Images: {len(gen_paths)}\n")
-        f.write(f"FID: {fid_val:.4f}\n")
-        f.write(f"DINO Similarity: {dino_val:.4f}\n")
-    
-    print(f"\nFinal Results:\nFID: {fid_val:.4f}\nDINO: {dino_val:.4f}")
+        # Generation
+        existing_gen = list(class_out_dir.glob("*.png"))
+        needed = NUM_IMAGES_PER_CLASS - len(existing_gen)
+        if needed > 0:
+            print(f"  Generating {needed} images...")
+            generator = torch.manual_seed(42)
+            for i in tqdm(range(0, needed, BATCH_SIZE)):
+                curr_batch = min(BATCH_SIZE, needed - i)
+                imgs = pipeline([prompt]*curr_batch, generator=generator).images
+                for j, img in enumerate(imgs):
+                    img.save(class_out_dir / f"gen_{len(existing_gen) + i + j:05d}.png")
+        
+        # Metrics
+        gen_files = sorted(list(class_out_dir.glob("*.png")))[:NUM_IMAGES_PER_CLASS]
+        metrics = evaluator.compute_metrics(gen_files, real_paths, prompt)
+        metrics["Pathology"] = pathology
+        results.append(metrics)
+        
+    # Save Final Table
+    df_res = pd.DataFrame(results)
+    df_res.to_csv(os.path.join(OUTPUT_ROOT, "final_metrics.csv"), index=False)
+    print("\nEvaluation Complete. Results saved to final_metrics.csv")
 
 if __name__ == "__main__":
     main()
